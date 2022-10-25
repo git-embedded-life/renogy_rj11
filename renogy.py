@@ -7,10 +7,11 @@ import sys
 import subprocess
 import secrets
 import threading
+from datetime import datetime
 
 
-AC_INV_PIN = 23
-FAULT_PIN = 24
+AC_INV_PIN = 24
+FAULT_PIN = 23
 FLASH_TIMEOUT_S = 2
 # When in off state, input should be a constant 1 (BJT inverses everything)
 LED_ON = 0
@@ -26,8 +27,7 @@ class Pin_State():
     }
 
     def __init__(self):
-        print("Init State to ON")
-        self.state = self._state_ON
+        self.state_fn = self._state_OFF
         self.previous_led_on_off = None
         self.led_on_off = None
         self.timestamp = None
@@ -35,8 +35,7 @@ class Pin_State():
 
     def _state_OFF(self):
         if self.led_on_off == LED_ON:
-            print("State - FLASH")
-            self.state = self._state_FLASH
+            self.state_fn = self._state_FLASH
 
         return
 
@@ -47,11 +46,9 @@ class Pin_State():
 
         if time.time() - self.timestamp > FLASH_TIMEOUT_S:
             if self.led_on_off == LED_ON:
-                self.state = self._state_ON
-                print("State - ON")
+                self.state_fn = self._state_ON
             else:
-                self.state = self._state_OFF
-                print("State - OFF")
+                self.state_fn = self._state_OFF
 
             self.timestamp = None
 
@@ -61,60 +58,73 @@ class Pin_State():
 
     def _state_ON(self):
         if self.led_on_off == LED_OFF:
-            self.state = self._state_FLASH
-            print("State - FLASH")
+            self.state_fn = self._state_FLASH
         return
 
     def run(self, led_on_off):
         self.previous_led_on_off = self.led_on_off
         self.led_on_off = led_on_off
         # Run the function currently pointed to by state
-        self.state()
+        self.state_fn()
         return
 
     def get_state(self):
-        return Pin_State.state_strings[self.state.__name__]
+        return Pin_State.state_strings[self.state_fn.__name__]
 
 
 class UPS():
+    class State(Enum):
+        OFF = 0
+        ONLINE = 1
+        ON_BATTERY = 2
+        LOW_BATTERY = 3
+        FAULT = 4
+
     def __init__(self):
-        self._input_voltage = 0
-        self._output_voltage = 0
+        self._state = UPS.State.OFF
+        self._last_read_state = None
         self._ups_status = "OL"
-        self._battery_runtime = 0
+        self._battery_runtime = RUNTIME
         self._power_loss_time = None
 
-    def ups_state(self, state):
-        if state == "ON":
-            self._input_voltage = 120
-            self._output_voltage = 120
-            self._ups_status = "OL"
-            self._battery_runtime = RUNTIME
-            self._power_loss_time = None
-        elif state == "OFF":
-            self._output_voltage = 0
-        elif state == "FLASH":
+    def run(self, ac_inv_state, fault_state):
+        if fault_state == "ON" or fault_state == "FLASH":
+            if self._state != UPS.State.FAULT:
+                self._state = UPS.State.FAULT
+                self._ups_status = "OB LB"
+                self._battery_runtime = 0
+
+        elif ac_inv_state == "ON":
+            if self._state != UPS.State.ONLINE:
+                self._state = UPS.State.ONLINE
+                self._ups_status = "OL"
+                self._battery_runtime = RUNTIME
+                self._power_loss_time = None
+
+        elif ac_inv_state == "OFF":
+            if self._state != UPS.State.OFF:
+                self._state = UPS.State.OFF
+                self._ups_status = "OL"
+                self._battery_runtime = 0
+
+        elif ac_inv_state == "FLASH":
             if self._power_loss_time == None:
                 self._power_loss_time = time.time()
 
-            self._input_voltage = 0
-            self._output_voltage = 120
-            self._ups_status = "OB"
-            # self._ups_status = "OL"
             self._battery_runtime = RUNTIME - int(time.time() - self._power_loss_time)
 
             if self._battery_runtime <= 0:
                 self._battery_runtime = 0
-                self._ups_status = "OB LB"
-                # self._ups_status = "OL"
 
-    @property
-    def input_voltage(self):
-        return self._input_voltage
+                if self._state != UPS.State.LOW_BATTERY:
+                    self._state = UPS.State.LOW_BATTERY
+                    self._ups_status = "OB LB"
 
-    @property
-    def output_voltage(self):
-        return self._output_voltage
+                return
+                
+            if self._state != UPS.State.ON_BATTERY:
+                self._state = UPS.State.ON_BATTERY
+                self._ups_status = "OB"
 
     @property
     def ups_status(self):
@@ -124,9 +134,19 @@ class UPS():
     def battery_runtime(self):
         return self._battery_runtime
 
-def _led_daemon(ac_inv):
+    @property
+    def get_state_if_changed(self):
+        if self._last_read_state == self._state:
+            return None
+
+        self._last_read_state = self._state
+        return self._state
+
+
+def _led_daemon(ac_inv, fault):
     while True:
         ac_inv.run(GPIO.input(AC_INV_PIN))
+        fault.run(GPIO.input(FAULT_PIN))
         time.sleep(.2)
 
 def main():
@@ -134,21 +154,18 @@ def main():
     GPIO.setup([AC_INV_PIN, FAULT_PIN], GPIO.IN)
 
     ac_inv = Pin_State()
+    fault = Pin_State()
     ups = UPS()
 
-    led_daemon = threading.Thread(target=_led_daemon, args=(ac_inv,), daemon=True)
+    led_daemon = threading.Thread(target=_led_daemon, args=(ac_inv, fault, ), daemon=True)
     led_daemon.start()
 
     while True:
-        ups.ups_state(ac_inv.get_state())
+        ups.run(ac_inv.get_state(), fault.get_state())
 
-        print("In Volt: {}, Out Volt: {}, Runtime: {}, State: {}".format(ups.input_voltage, ups.output_voltage, ups.battery_runtime, ups.ups_status), flush=True)
-        
-        # if "SUCCESS" not in subprocess.run(["/usr/local/ups/bin/upsrw", "-w", "-u", "renogy_py", "-p", secrets.nut_pw, "-s", "input.voltage={}".format(ups.input_voltage), "renogy"], capture_output=True).stderr.decode():
-        #     print("Error writing to input.voltage")
-
-        # if "SUCCESS" not in subprocess.run(["/usr/local/ups/bin/upsrw", "-w", "-u", "renogy_py", "-p", secrets.nut_pw, "-s", "output.voltage={}".format(ups.output_voltage), "renogy"], capture_output=True).stderr.decode():
-        #     print("Error writing to output.voltage")
+        state = ups.get_state_if_changed
+        if state is not None:
+            print("State: {}, Status: {}, Runtime: {}, AC_INV: {}, FAULT: {}".format(state.name if state else "None", ups.ups_status, ups.battery_runtime, ac_inv.get_state(), fault.get_state()), flush=True)
 
         if "SUCCESS" not in subprocess.run(["/usr/local/ups/bin/upsrw", "-w", "-u", "renogy_py", "-p", secrets.nut_pw, "-s", "battery.runtime={}".format(ups.battery_runtime), "renogy"], capture_output=True).stderr.decode():
             print("Error writing to battery.runtime")
